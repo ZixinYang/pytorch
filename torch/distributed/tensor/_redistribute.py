@@ -442,11 +442,10 @@ class DTensorRedistributePlanner:
         src_spec: DTensorSpec,
         dst_spec: DTensorSpec,
         full_tensor_shape: tuple[int, ...],
-        src_shard_order: TensorDimTuple,
-        dst_shard_order: TensorDimTuple,
     ) -> list[_TransformInfo]:
-        src_state = self.DistState(src_spec.placements, src_shard_order)
-        dst_state = self.DistState(dst_spec.placements, dst_shard_order)
+        assert src_spec.shard_order is not None and dst_spec.shard_order is not None
+        src_state = self.DistState(src_spec.placements, src_spec.shard_order)
+        dst_state = self.DistState(dst_spec.placements, dst_spec.shard_order)
         transform_infos: list[_TransformInfo] = []
         state_path = self.find_min_cost_path(src_state, dst_state)
         logger.debug(
@@ -670,11 +669,13 @@ def _is_default_device_order(shard_order: TensorDimTuple) -> bool:
 def _gen_transform_infos_non_cached(
     src_spec: DTensorSpec,
     dst_spec: DTensorSpec,
-    src_shard_order: TensorDimTuple,
-    dst_shard_order: TensorDimTuple,
 ) -> list[_TransformInfo]:
     transform_infos: list[_TransformInfo] = []
     device_mesh = src_spec.device_mesh
+    src_shard_order = src_spec.shard_order
+    dst_shard_order = dst_spec.shard_order
+    assert src_shard_order is not None and dst_shard_order is not None
+    assert len(src_shard_order) == len(dst_shard_order)
     if all(
         _is_default_device_order(order) for order in (src_shard_order, dst_shard_order)
     ):
@@ -687,7 +688,7 @@ def _gen_transform_infos_non_cached(
         transform_infos = drp.generate_greedy_transform_infos(src_spec, dst_spec)
     else:
         transform_infos = drp.generate_optimal_transform_infos(
-            src_spec, dst_spec, src_spec.shape, src_shard_order, dst_shard_order
+            src_spec, dst_spec, src_spec.shape
         )
     return transform_infos
 
@@ -696,20 +697,14 @@ def _gen_transform_infos_non_cached(
 def _gen_transform_infos(
     src_spec: DTensorSpec,
     dst_spec: DTensorSpec,
-    src_device_order: TensorDimTuple,
-    dst_device_order: TensorDimTuple,
 ) -> list[_TransformInfo]:
-    return _gen_transform_infos_non_cached(
-        src_spec, dst_spec, src_device_order, dst_device_order
-    )
+    return _gen_transform_infos_non_cached(src_spec, dst_spec)
 
 
 def redistribute_local_tensor(
     local_tensor: torch.Tensor,
     current_spec: DTensorSpec,
     target_spec: DTensorSpec,
-    src_shard_order: Optional[TensorDimTuple] = None,
-    dst_shard_order: Optional[TensorDimTuple] = None,
     *,
     async_op: bool = False,
     is_backward: bool = False,
@@ -724,15 +719,6 @@ def redistribute_local_tensor(
         # TODO: alltoall/permute reshuffling to change device_mesh if they are not the same
         raise NotImplementedError("Cross device mesh comm not supported yet!")
 
-    if not src_shard_order:
-        src_shard_order = DTensorSpec.compute_default_sparse_shard_order(
-            current_spec.placements, current_spec.mesh
-        )
-    if not dst_shard_order:
-        dst_shard_order = DTensorSpec.compute_default_sparse_shard_order(
-            target_spec.placements, target_spec.mesh
-        )
-
     new_local_tensor = local_tensor
     device_mesh = current_spec.mesh
 
@@ -744,13 +730,9 @@ def redistribute_local_tensor(
         return local_tensor
 
     if _are_we_tracing():
-        transform_infos = _gen_transform_infos_non_cached(
-            current_spec, target_spec, src_shard_order, dst_shard_order
-        )
+        transform_infos = _gen_transform_infos_non_cached(current_spec, target_spec)
     else:
-        transform_infos = _gen_transform_infos(
-            current_spec, target_spec, src_shard_order, dst_shard_order
-        )
+        transform_infos = _gen_transform_infos(current_spec, target_spec)
 
     debug_mode = get_active_debug_mode()
     redistribute_context = (
@@ -762,7 +744,7 @@ def redistribute_local_tensor(
                 device_mesh,
                 transform_infos,
                 current_spec.placements,
-                src_shard_order,
+                current_spec.shard_order,
             ),
         )
         if debug_mode is not None
@@ -885,7 +867,6 @@ class Redistribute(torch.autograd.Function):
         ctx.async_op = async_op
         ctx.backward_dtype = backward_dtype
         ctx.original_dtype = input._local_tensor.dtype
-        ctx.original_device_order = input._spec.shard_order
 
         if forward_dtype is not None and forward_dtype != input._local_tensor.dtype:
             local_tensor = input._local_tensor.to(dtype=forward_dtype)
@@ -912,13 +893,10 @@ class Redistribute(torch.autograd.Function):
                 shard_order=shard_order,
                 tensor_meta=current_spec.tensor_meta,
             )
-
             output = redistribute_local_tensor(
                 local_tensor,
                 current_spec,
                 target_spec,
-                src_shard_order=input._spec.shard_order,
-                dst_shard_order=shard_order,
                 async_op=async_op,
             )
         else:
@@ -962,8 +940,6 @@ class Redistribute(torch.autograd.Function):
             local_tensor,
             current_spec,
             previous_spec,
-            src_shard_order=current_spec.shard_order,
-            dst_shard_order=previous_spec.shard_order,
             async_op=async_op,
             is_backward=True,
         )
